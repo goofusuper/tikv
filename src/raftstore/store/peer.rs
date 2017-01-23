@@ -686,10 +686,81 @@ impl Peer {
             }
             vec![]
         } else {
-            self.handle_raft_committed_entries(ready.committed_entries.take().unwrap())
+            let committed_entries = ready.committed_entries.take().unwrap();
+            // only leader need to update lease.
+            let mut to_be_updated = self.is_leader();
+            for entry in committed_entries.iter().rev() {
+                // raft meta is very small, can be ignored.
+                self.raft_log_size_hint += entry.get_data().len() as u64;
+                to_be_updated = to_be_updated && self.maybe_update_lease(entry.get_data());
+            }
+            if !committed_entries.is_empty() {
+                self.handle_raft_committed_entries(committed_entries)
+            } else {
+                vec![]
+            }
         };
 
         self.raft_group.advance(ready);
+    }
+
+    /// Try to update lease.
+    ///
+    /// If the it can make sure that its lease is the latest lease, returns true.
+    fn maybe_update_lease(&mut self, data: &[u8]) -> bool {
+        let mut req = RaftCmdRequest::new();
+        let propose_time = match req.merge_from_bytes(data)
+            .ok()
+            .and_then(|_| util::get_uuid_from_req(&req))
+            .and_then(|uuid| self.find_propose_time(uuid)) {
+            Some(t) => t,
+            _ => return false,
+        };
+
+        // Try to renew the leader lease as this command asks to.
+        if let Some(current_expired_time) = self.leader_lease_expired_time {
+            // This peer is leader and has recorded leader lease.
+            // Calculate the renewed lease for this command. If the renewed lease lives longer
+            // than the current leader lease, update the current leader lease to the renewed lease.
+            let next_expired_time = self.next_lease_expired_time(propose_time);
+            // Use the lease expired timestamp comparison here, so that these codes still
+            // work no matter how the leader changes before applying this command.
+            if current_expired_time < next_expired_time {
+                debug!("{} update leader lease expired time from {:?} to {:?}",
+                       self.tag,
+                       current_expired_time,
+                       next_expired_time);
+                self.leader_lease_expired_time = Some(next_expired_time)
+            }
+        } else if self.is_leader() {
+            // This peer is leader but its leader lease has expired.
+            // Calculate the renewed lease for this command, and update the leader lease
+            // for this peer.
+            let next_expired_time = self.next_lease_expired_time(propose_time);
+            debug!("{} update leader lease expired time from None to {:?}",
+                   self.tag,
+                   self.leader_lease_expired_time);
+            self.leader_lease_expired_time = Some(next_expired_time);
+        }
+
+        true
+    }
+
+    fn find_propose_time(&mut self, uuid: Uuid) -> Option<Timespec> {
+        if !self.pending_cmds.contains(&uuid) {
+            return None;
+        }
+        for cmd in self.pending_cmds.normals.iter_mut().rev() {
+            if cmd.uuid == uuid {
+                return cmd.renew_lease_time.take();
+            }
+        }
+        if let Some(cmd) = self.pending_cmds.conf_change.as_mut() {
+            if cmd.uuid == uuid {
+                return cmd.renew_lease_time.take();
+            }
+        }
+        None
     }
 
     /// Propose a request.
@@ -1168,9 +1239,6 @@ impl Peer {
                        entry.get_index());
             }
 
-            // raft meta is very small, can be ignored.
-            self.raft_log_size_hint += entry.get_data().len() as u64;
-
             let res = match entry.get_entry_type() {
                 eraftpb::EntryType::EntryNormal => self.handle_raft_entry_normal(entry),
                 eraftpb::EntryType::EntryConfChange => self.handle_raft_entry_conf_change(entry),
@@ -1246,15 +1314,11 @@ impl Peer {
         }))
     }
 
-    fn find_cb(&mut self,
-               uuid: Uuid,
-               term: u64,
-               cmd: &RaftCmdRequest)
-               -> Option<(Callback, Timespec)> {
+    fn find_cb(&mut self, uuid: Uuid, term: u64, cmd: &RaftCmdRequest) -> Option<Callback> {
         if get_change_peer_cmd(cmd).is_some() {
             if let Some(mut cmd) = self.pending_cmds.take_conf_change() {
                 if cmd.uuid == uuid {
-                    return Some((cmd.cb.take().unwrap(), cmd.renew_lease_time.unwrap()));
+                    return Some(cmd.cb.take().unwrap());
                 } else {
                     self.notify_stale_command(cmd);
                 }
@@ -1263,7 +1327,7 @@ impl Peer {
         }
         while let Some(mut head) = self.pending_cmds.pop_normal(term) {
             if head.uuid == uuid {
-                return Some((head.cb.take().unwrap(), head.renew_lease_time.unwrap()));
+                return Some(head.cb.take().unwrap());
             }
             // Because of the lack of original RaftCmdRequest, we skip calling
             // coprocessor here.
@@ -1298,32 +1362,8 @@ impl Peer {
             return exec_result;
         }
 
-        let (cb, lease_renew_time) = cmd_cb.unwrap();
-        // Try to renew the leader lease as this command asks to.
-        if let Some(current_expired_time) = self.leader_lease_expired_time {
-            // This peer is leader and has recorded leader lease.
-            // Calculate the renewed lease for this command. If the renewed lease lives longer
-            // than the current leader lease, update the current leader lease to the renewed lease.
-            let next_expired_time = self.next_lease_expired_time(lease_renew_time);
-            // Use the lease expired timestamp comparison here, so that these codes still
-            // work no matter how the leader changes before applying this command.
-            if current_expired_time < next_expired_time {
-                debug!("{} update leader lease expired time from {:?} to {:?}",
-                       self.tag,
-                       current_expired_time,
-                       next_expired_time);
-                self.leader_lease_expired_time = Some(next_expired_time)
-            }
-        } else if self.is_leader() {
-            // This peer is leader but its leader lease has expired.
-            // Calculate the renewed lease for this command, and update the leader lease
-            // for this peer.
-            let next_expired_time = self.next_lease_expired_time(lease_renew_time);
-            debug!("{} update leader lease expired time from None to {:?}",
-                   self.tag,
-                   self.leader_lease_expired_time);
-            self.leader_lease_expired_time = Some(next_expired_time);
-        }
+        let cb = cmd_cb.unwrap();
+
         // Involve post apply hook.
         self.coprocessor_host.post_apply(self.raft_group.get_store(), &cmd, &mut resp);
         // TODO: if we have exec_result, maybe we should return this callback too. Outer
